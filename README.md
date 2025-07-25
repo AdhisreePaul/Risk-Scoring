@@ -82,4 +82,3 @@ wallet_id,score
 - **Market Diversity**  
   Reflects sophistication: interacting across multiple markets reduces exploit likelihood.
 
----

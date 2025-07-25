@@ -1,9 +1,6 @@
-# feature_engineering.py
-
 import json
 import pandas as pd
 from collections import defaultdict
-from datetime import datetime
 
 # 1. Load the raw transactions
 with open("all_transactions.json", "r") as f:
@@ -22,7 +19,6 @@ wallet_feats = defaultdict(lambda: {
 })
 
 # 3. Define a helper to convert token amount → USD
-#    (You can extend this to use Coingecko prices if you saved them)
 def to_usd(amount_str, price_usd):
     try:
         return float(amount_str) * float(price_usd)
