@@ -1,53 +1,40 @@
 # Compound Risk Scoring Pipeline
 
-A reproducible pipeline to assign a **risk score (0–1000)** to Compound V2/V3 wallets based on on‑chain transaction behavior.
-
----
-
-## Project Structure
-
-```
-compound-risk-scoring/
-├── fetch_transactions.py      # Fetch raw transactions from Etherscan
-├── feature_engineering.py     # Aggregate and preprocess wallet features
-├── risk_scoring.py            # Compute wallet risk scores
-├── wallets.txt                # Input list of 100 wallet addresses
-├── all_transactions.json      # Raw transactions per wallet
-├── features.csv               # Engineered features per wallet
-├── risk_scores.csv            # Final risk scores per wallet
-├── .env                       # Environment variables (e.g. API keys)
-├── .gitignore                 # Excluded files
-└── README.md                  # Project documentation
-```
+This project implements a reproducible, end‑to‑end pipeline to assign each of 100 Compound V2/V3 wallet addresses a **risk score** from **0 to 1000**, based on their on‑chain transaction behavior.
 
 ---
 
 ## 1. Data Collection Method
 
-* **Source:** Etherscan API (Account Module → `txlist`) to retrieve all transactions for each wallet from block 0 to latest.
-* **Procedure:**
+Transactions are fetched via the **Etherscan API** (Account → `txlist`):
 
-  1. Read 100 wallet addresses from `wallets.txt`.
-  2. For each wallet, call Etherscan with a 10 s timeout, up to 3 retries, and a 0.2 s delay between requests to respect rate limits.
-  3. Store responses in `all_transactions.json` for reproducibility.
-* **Filtering:** Later scripts will filter these raw transactions to only include Compound V2/V3 contract interactions (e.g., `mint`, `borrow`, `repayBorrow`, `redeem`, `liquidateBorrow`).
+- **Script:** `fetch_transactions.py`  
+- **Process:**  
+  1. Read 100 wallet addresses from `wallets.txt`.  
+  2. For each address, call Etherscan with a 10 s timeout, up to 3 retries, and exponential back‑off on failures.  
+  3. Pause 0.2 s between calls to respect rate limits.  
+  4. Save all raw transaction arrays into `all_transactions.json`. :contentReference[oaicite:3]{index=3}  
 
 ---
 
 ## 2. Feature Selection Rationale
 
-We engineered wallet‑level features that capture both risk and responsible behavior:
+We aggregate per‑wallet metrics that capture both **activity intensity** and **risk signals**:
 
-| Feature                | Description                                       | Rationale                                   |
-| ---------------------- | ------------------------------------------------- | ------------------------------------------- |
-| **Total Borrowed USD** | Sum of all borrowed amounts in USD                | Measures leverage aggressiveness            |
-| **Total Supplied USD** | Sum of all collateral supplied in USD             | Baseline for collateral utilization         |
-| **Repayment Ratio**    | `repaid_usd / borrowed_usd` (clipped to 1)        | Indicates loan servicing quality            |
-| **Utilization Ratio**  | `borrowed_usd / supplied_usd` (clipped to 1)      | High values → thin collateral buffer        |
-| **Num Liquidations**   | Count of `liquidateBorrow` events                 | Direct indicator of collateral failure      |
-| **Active Days**        | `(last_ts - first_ts) / 86400`                    | Longer histories reduce noise               |
-| **Total Tx Count**     | Number of protocol events                         | Differentiates engaged users vs bots        |
-| **Market Diversity**   | Number of distinct cToken markets interacted with | Reflects sophistication and diversification |
+| Feature               | Description                                                            | Rationale                                            |
+|-----------------------|------------------------------------------------------------------------|------------------------------------------------------|
+| **total_tx**          | Number of transactions                                                  | More interactions → engaged user                     |
+| **total_value**       | Sum of `value` fields (wei → ETH)                                       | Volume of on‑chain value transferred                 |
+| **avg_value**         | Mean transaction value                                                  | Typical transaction size                             |
+| **total_gas**         | Sum of gas used                                                         | Overall gas spend                                     |
+| **avg_gas**           | Mean gas per transaction                                                | Efficiency vs. complex calls                         |
+| **total_cumulative_gas** | Sum of `cumulativeGasUsed`                                           | Network impact and priority                          |
+| **avg_cumulative_gas** | Mean cumulative gas                                                     | Average block‑level cost                              |
+| **block_range**       | `max(blockNumber) - min(blockNumber)`                                   | Span of protocol usage                                |
+| **nonce_range**       | `max(nonce) - min(nonce)`                                               | Transaction ordering diversity                        |
+| **active_days**       | `(last_ts – first_ts)/86400`                                            | Duration of wallet activity over time                 |  
+ 
+All features are computed in **`feature_engineering.py`** by iterating wallets and aggregating values, gas, block/nonce ranges, and timestamps from `all_transactions.json` :contentReference[oaicite:4]{index=4}.
 
 ---
 
@@ -55,78 +42,33 @@ We engineered wallet‑level features that capture both risk and responsible beh
 
 Each feature contributes to a weighted sum, capped at **1,000 points**:
 
-1. **Repayment Ratio (max 1) → 300 pts**
+| Component                              | Max Points | Formula / Notes                                                                                   |
+|----------------------------------------|-----------:|---------------------------------------------------------------------------------------------------|
+| **Transaction Volume**                 | 200        | `min(log1p(total_tx)/log(500)*200, 200)`                                                          |
+| **Total Value**                        | 200        | `min(log1p(total_value)/log(1e20)*200, 200)`                                                      |
+| **Avg Gas Penalty**                    | 100        | `max(0, 100 - min(avg_gas/1e6, 100))` (higher avg gas → lower score)                               |
+| **Active Days (log‑scale)**            | 150        | `min(log1p(active_days)/log(365)*150, 150)`                                                        |
+| **Block Range (log‑scale)**            | 100        | `min(log1p(block_range)/log(1e7)*100, 100)`                                                        |
+| **Nonce Range (log‑scale)**            | 100        | `min(log1p(nonce_range)/log(1e5)*100, 100)`                                                        |
+| **Cumulative Gas Penalty**             | 150        | `max(0, 150 - min(total_cumulative_gas/1e9, 150))`                                                 |
 
-   ```python
-   pts = 300 * min(repay_ratio, 1.0)
-   ```
-2. **Liquidation Penalty → −100 pts per event**
-3. **Utilization Safety (max 1) → 200 pts**
-
-   ```python
-   pts = 200 * (1 - min(utilization, 1.0))
-   ```
-4. **Active Days (log-scale) → up to 150 pts**
-
-   ```python
-   pts = 150 * log1p(active_days) / log(365)
-   ```
-5. **Tx Volume (log-scale) → up to 150 pts**
-
-   ```python
-   pts = 150 * log1p(total_tx) / log(500)
-   ```
-6. **Market Diversity (0–10+) → up to 100 pts**
-
-   ```python
-   pts = 100 * min(num_markets, 10) / 10
-   ```
-
-**Final Score:**
-
-```python
-score = sum(all_pts)
-score = int(clip(score, 0, 1000))
-```
+The scoring logic is implemented in **`risk_scoring.py`**, which reads `features.csv`, applies the above formula, clips to [0, 1000], and outputs `risk_scores.csv` :contentReference[oaicite:5]{index=5}.
 
 ---
 
 ## 4. Justification of Risk Indicators
 
-* **Repayment Ratio:** Key metric of creditworthiness—wallets that repay demonstrate responsibility.
-* **Liquidations:** The strongest negative signal—indicates collateral shortfall events.
-* **Utilization Ratio:** Balances risk; high utilization implies less buffer for price swings.
-* **Active Days & Tx Count:** Genuine users typically have longer, more active histories; bots or throwaway addresses show sparse or bursty patterns.
-* **Market Diversity:** Interaction across multiple markets signals sophisticated portfolio management, not simple exploit or bot behavior.
+- **Transaction Volume & Value**  
+  High interaction counts and on‑chain value suggest active, legitimate protocol usage; low values may indicate dormant or spammy addresses.
+
+- **Gas Metrics (avg & cumulative)**  
+  Excessive gas use often accompanies complex or exploitative transactions; penalizing high gas consumption rewards efficiency.
+
+- **Active Days, Block & Nonce Range**  
+  Longer spans and wider block/nonce ranges reflect sustained, orderly engagement rather than bursty or throwaway behavior.
+
+- **Weighted Penalties & Caps**  
+  Log‑scaling prevents outliers from dominating; penalties for gas metrics ensure resource‑heavy patterns receive lower scores.
 
 ---
 
-## How to Run
-
-1. **Set API key** in `.env`:
-
-   ```bash
-   ETHERSCAN_API_KEY=your_key
-   ```
-2. **Fetch transactions**:
-
-   ```bash
-   python fetch_transactions.py
-   ```
-3. **Generate features**:
-
-   ```bash
-   python feature_engineering.py
-   ```
-4. **Compute risk scores**:
-
-   ```bash
-   python risk_scoring.py
-   ```
-
-Outputs:
-
-* `features.csv`
-* `risk_scores.csv`
-
----
