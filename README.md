@@ -1,85 +1,132 @@
-Wallet Risk Scoring Pipeline
+# Compound Risk Scoring Pipeline
 
-## Overview
-This repository implements an end‑to‑end pipeline to assign each of 100 Compound V2/V3 wallet addresses a **risk score** between 0 and 1000 based on on‑chain borrowing behavior.
-
----
-
-## 1. Data Collection
-
-1. **Source**  
-   - Etherscan API: fetched all on‑chain transactions per wallet  
-2. **Scope**  
-   - Block 0 → latest, capturing every interaction  
-3. **Filtering**  
-   - Kept only Compound events:  
-     - `mint` → deposit collateral  
-     - `redeem` → withdraw collateral  
-     - `borrow` → borrow funds  
-     - `repayBorrow` → repay loans  
-     - `liquidateBorrow` → liquidation calls  
-4. **Storage**  
-   - Saved into `all_transactions.json` for reproducibility  
+A reproducible pipeline to assign a **risk score (0–1000)** to Compound V2/V3 wallets based on on‑chain transaction behavior.
 
 ---
 
-## 2. Feature Engineering (Selection Rationale)
+## Project Structure
 
-We aggregate each wallet’s transactions into these metrics:
+```
+compound-risk-scoring/
+├── fetch_transactions.py      # Fetch raw transactions from Etherscan
+├── feature_engineering.py     # Aggregate and preprocess wallet features
+├── risk_scoring.py            # Compute wallet risk scores
+├── wallets.txt                # Input list of 100 wallet addresses
+├── all_transactions.json      # Raw transactions per wallet
+├── features.csv               # Engineered features per wallet
+├── risk_scores.csv            # Final risk scores per wallet
+├── .env                       # Environment variables (e.g. API keys)
+├── .gitignore                 # Excluded files
+└── README.md                  # Project documentation
+```
 
-| Column                | Description                                                         |
-|-----------------------|---------------------------------------------------------------------|
-| `total_tx`            | Number of Compound events                                           |
-| `borrowed_usd`        | Sum of all borrowed amounts (USD)                                   |
-| `repaid_usd`          | Sum of all repaid amounts (USD)                                     |
-| `supplied_usd`        | Sum of all collateral supplied (USD)                                |
-| `redeemed_usd`        | Sum of all collateral redeemed (USD)                                |
-| `num_liquidations`    | Count of `liquidateBorrow` events                                   |
-| `repay_ratio`         | `repaid_usd / borrowed_usd` (clipped to 1)                          |
-| `utilization`         | `borrowed_usd / supplied_usd` (clipped to 1)                        |
-| `active_days`         | `(last_timestamp – first_timestamp) / 86 400`                       |
-| `num_markets`         | Number of distinct cToken markets interacted with                   |
+---
 
-Saved as `features.csv`.
+## 1. Data Collection Method
+
+* **Source:** Etherscan API (Account Module → `txlist`) to retrieve all transactions for each wallet from block 0 to latest.
+* **Procedure:**
+
+  1. Read 100 wallet addresses from `wallets.txt`.
+  2. For each wallet, call Etherscan with a 10 s timeout, up to 3 retries, and a 0.2 s delay between requests to respect rate limits.
+  3. Store responses in `all_transactions.json` for reproducibility.
+* **Filtering:** Later scripts will filter these raw transactions to only include Compound V2/V3 contract interactions (e.g., `mint`, `borrow`, `repayBorrow`, `redeem`, `liquidateBorrow`).
+
+---
+
+## 2. Feature Selection Rationale
+
+We engineered wallet‑level features that capture both risk and responsible behavior:
+
+| Feature                | Description                                       | Rationale                                   |
+| ---------------------- | ------------------------------------------------- | ------------------------------------------- |
+| **Total Borrowed USD** | Sum of all borrowed amounts in USD                | Measures leverage aggressiveness            |
+| **Total Supplied USD** | Sum of all collateral supplied in USD             | Baseline for collateral utilization         |
+| **Repayment Ratio**    | `repaid_usd / borrowed_usd` (clipped to 1)        | Indicates loan servicing quality            |
+| **Utilization Ratio**  | `borrowed_usd / supplied_usd` (clipped to 1)      | High values → thin collateral buffer        |
+| **Num Liquidations**   | Count of `liquidateBorrow` events                 | Direct indicator of collateral failure      |
+| **Active Days**        | `(last_ts - first_ts) / 86400`                    | Longer histories reduce noise               |
+| **Total Tx Count**     | Number of protocol events                         | Differentiates engaged users vs bots        |
+| **Market Diversity**   | Number of distinct cToken markets interacted with | Reflects sophistication and diversification |
 
 ---
 
 ## 3. Scoring Method
 
-Each feature maps to a point bucket; total points capped at 1000:
+Each feature contributes to a weighted sum, capped at **1,000 points**:
 
-| Feature                        | Points (Max) | Formula / Notes                                                                 |
-|--------------------------------|-------------:|----------------------------------------------------------------------------------|
-| **Repayment Ratio**            | 300          | `300 × min(repay_ratio, 1.0)`                                                    |
-| **Liquidations**               | –100 per evt | Subtract 100 for each `num_liquidations` (floor at zero)                         |
-| **Utilization Ratio**          | 200          | `200 × (1 – min(utilization, 1.0))`                                              |
-| **Active Days (log scale)**    | 150          | `150 × ln(1 + active_days) / ln(365)`                                            |
-| **Total Tx Count (log scale)** | 150          | `150 × ln(1 + total_tx) / ln(500)`                                               |
-| **Market Diversity**           | 100          | `100 × min(num_markets, 10) / 10`                                                |
+1. **Repayment Ratio (max 1) → 300 pts**
 
-**Final Score**  
-`score = clamp( sum(all components), 0, 1000 )`, then rounded to an integer.  
-Exported to `risk_scores.csv` with columns:
-```csv
-wallet_id,score
-0x0039f22efb07a647557c7c5d17854cfd6d489ef3,510
-…    
+   ```python
+   pts = 300 * min(repay_ratio, 1.0)
+   ```
+2. **Liquidation Penalty → −100 pts per event**
+3. **Utilization Safety (max 1) → 200 pts**
 
-## 4. Justification of Risk Indicators Used
+   ```python
+   pts = 200 * (1 - min(utilization, 1.0))
+   ```
+4. **Active Days (log-scale) → up to 150 pts**
 
-- **Repayment Ratio**  
-  Core measure of on‑time loan servicing and creditworthiness.
+   ```python
+   pts = 150 * log1p(active_days) / log(365)
+   ```
+5. **Tx Volume (log-scale) → up to 150 pts**
 
-- **Liquidations**  
-  Direct proof of under‑collateralization; highest penalty.
+   ```python
+   pts = 150 * log1p(total_tx) / log(500)
+   ```
+6. **Market Diversity (0–10+) → up to 100 pts**
 
-- **Utilization Ratio**  
-  Balances borrowed vs. supplied collateral; high values indicate thin safety buffers.
+   ```python
+   pts = 100 * min(num_markets, 10) / 10
+   ```
 
-- **Active Days & Tx Count**  
-  Distinguish persistent, engaged users from one‑off or bot addresses.
+**Final Score:**
 
-- **Market Diversity**  
-  Reflects sophistication: interacting across multiple markets reduces exploit likelihood.
+```python
+score = sum(all_pts)
+score = int(clip(score, 0, 1000))
+```
 
+---
 
+## 4. Justification of Risk Indicators
+
+* **Repayment Ratio:** Key metric of creditworthiness—wallets that repay demonstrate responsibility.
+* **Liquidations:** The strongest negative signal—indicates collateral shortfall events.
+* **Utilization Ratio:** Balances risk; high utilization implies less buffer for price swings.
+* **Active Days & Tx Count:** Genuine users typically have longer, more active histories; bots or throwaway addresses show sparse or bursty patterns.
+* **Market Diversity:** Interaction across multiple markets signals sophisticated portfolio management, not simple exploit or bot behavior.
+
+---
+
+## How to Run
+
+1. **Set API key** in `.env`:
+
+   ```bash
+   ETHERSCAN_API_KEY=your_key
+   ```
+2. **Fetch transactions**:
+
+   ```bash
+   python fetch_transactions.py
+   ```
+3. **Generate features**:
+
+   ```bash
+   python feature_engineering.py
+   ```
+4. **Compute risk scores**:
+
+   ```bash
+   python risk_scoring.py
+   ```
+
+Outputs:
+
+* `features.csv`
+* `risk_scores.csv`
+
+---
